@@ -1,9 +1,9 @@
 name: VPN Gate Node Check
 
 on:
-  # 定时检测: 每 60 分钟一次 (每小时整点, UTC)。如需 30 分钟一次改回: cron: "*/30 * * * *"
+  # 定时检测: 每 60 分钟一次, 设在每小时第 30 分 (避开 GitHub 整点负载高峰, 减少排队延迟/丢弃)
   schedule:
-    - cron: "0 * * * *"
+    - cron: "30 * * * *"
   workflow_dispatch:
 
 permissions:
