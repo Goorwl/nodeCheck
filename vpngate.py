@@ -51,11 +51,19 @@ VPNGATE_MIRROR = os.environ.get(
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json",
 )
 # 已部署的 Cloudflare Worker 检测接口 (GET /check?proxyip=host:port, 实测确认)
-WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://nodecheck.rizizhenhya0604.online//check?sstp=vpn:vpn@")
+# 注意: 路径必须是单斜杠 /check; 双斜杠 //check 会命中 Worker 网页路由返回 HTML (非 JSON)
+WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://nodecheck.rizizhenhya0604.online/check?sstp=vpn:vpn@")
 CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))   # 与 Worker 网页端一致的并发模型
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))          # 单请求客户端超时 (秒)
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))         # 0=不限; 本地测试可设小值
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))              # 拉取数据源超时
+
+# 历史可用节点池: 每轮把「当轮节点 + 池内存活节点」一起检测, success=true 的写回池文件
+# 供下轮复用 (对抗单轮检测假阴性 / CSV 采样间隙漏节点)。
+# 池文件不提交 git (避免 48 commits/天 污染历史): CI 用 actions/cache 跨轮持久化, 本地即 pool.json
+POOL_SIZE = int(os.environ.get("POOL_SIZE", "200"))                  # 池上限, 超出按质量淘汰
+POOL_FAIL_STREAK = int(os.environ.get("POOL_FAIL_STREAK", "6"))      # 连续明确失败 N 轮淘汰 (worker_error 不计)
+POOL_FILE = os.environ.get("POOL_FILE", os.path.join(REPO_DIR, "pool.json"))
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
 TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
 
@@ -279,6 +287,120 @@ def dedupe(nodes):
 
 
 # ---------------------------------------------------------------------------
+# 历史可用节点池 (不进 git; CI 用 actions/cache 持久化, 本地即 pool.json)
+# ---------------------------------------------------------------------------
+def _parse_ts(s):
+    try:
+        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S UTC").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _now_ts():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def load_pool():
+    """加载历史池。返回 dict: {(host_lower, port): pool_entry}。文件不存在/损坏 -> 空池。"""
+    if not os.path.exists(POOL_FILE):
+        log("POOL", "无历史池文件, 从空池开始")
+        return {}
+    try:
+        with open(POOL_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        entries = data.get("nodes") if isinstance(data, dict) else data
+        pool = {}
+        for e in entries or []:
+            host = str(e.get("host") or "").strip()
+            port = int(e.get("port") or 0)
+            if not host or not (1 <= port <= 65535):
+                continue
+            pool[(host.lower(), port)] = {
+                "host": host, "port": port,
+                "ip": e.get("ip"), "country": e.get("country"),
+                "country_code": e.get("country_code"),
+                "residential": e.get("residential") or "unknown",
+                "first_seen": e.get("first_seen") or _now_ts(),
+                "last_success_at": e.get("last_success_at") or _now_ts(),
+                "fail_streak": int(e.get("fail_streak") or 0),
+                "success_count": int(e.get("success_count") or 0),
+                "latency_ms": e.get("latency_ms"),
+            }
+        log("POOL", f"加载历史池: {len(pool)} 节点 ({os.path.basename(POOL_FILE)})")
+        return pool
+    except Exception as exc:
+        log("POOL", f"历史池文件损坏, 忽略并重建: {exc}")
+        return {}
+
+
+def merge_with_pool(nodes, pool):
+    """当轮节点 ∪ 池内存活节点 = 本轮检测候选集 (去重, 当轮优先)。
+    池内节点标记 from_pool=true, 便于统计与产物标注。"""
+    pool_alive = [dict(v, from_pool=True) for (h, p), v in pool.items()
+                  if (h, p) not in {(n["host"].lower(), n["port"]) for n in nodes}]
+    merged = nodes + pool_alive
+    log("POOL", f"合并: 当轮 {len(nodes)} + 池内独有 {len(pool_alive)} -> 检测候选 {len(merged)}")
+    return merged
+
+
+def update_pool(pool, results):
+    """用本轮检测结果更新池, 然后按质量淘汰到 POOL_SIZE 上限。返回淘汰统计。"""
+    now = _now_ts()
+    merged = dict(pool)
+    for r in results:
+        key = (r["host"].lower(), r["port"])
+        prev = merged.get(key)
+        if r.get("success"):
+            merged[key] = {
+                "host": r["host"], "port": r["port"],
+                "ip": (r.get("exit") or {}).get("ip") or (prev or {}).get("ip") or r.get("ip"),
+                "country": r.get("country"),
+                "country_code": r.get("country_code"),
+                "residential": r.get("residential") or "unknown",
+                "first_seen": (prev or {}).get("first_seen") or now,
+                "last_success_at": now,
+                "fail_streak": 0,
+                "success_count": ((prev or {}).get("success_count") or 0) + 1,
+                "latency_ms": r.get("latency_ms"),
+            }
+        elif prev:
+            # 只对池内已有节点累计失败; 当轮新节点失败不入池
+            if r.get("worker_error"):
+                pass  # Worker 抖动 (超时/非200/网络异常) 不计, 防止一轮抖动刷光全池
+            else:
+                prev["fail_streak"] = int(prev.get("fail_streak") or 0) + 1
+        # 当轮新节点明确失败: 不入池, 自然消失
+
+    # 淘汰 1: 连续明确失败 >= POOL_FAIL_STREAK 轮 (3 小时 @ 30min/轮)
+    evicted_streak = [k for k, v in merged.items() if int(v.get("fail_streak") or 0) >= POOL_FAIL_STREAK]
+    for k in evicted_streak:
+        del merged[k]
+
+    # 淘汰 2: 超过 POOL_SIZE 上限 -> 按 (success_count, last_success_at) 质量降序保留
+    evicted_overflow = 0
+    if len(merged) > POOL_SIZE:
+        ranked = sorted(
+            merged.items(),
+            key=lambda kv: (int(kv[1].get("success_count") or 0),
+                            _parse_ts(kv[1].get("last_success_at")) or datetime.min.replace(tzinfo=timezone.utc)),
+        )
+        evicted_overflow = len(merged) - POOL_SIZE
+        for k, _ in ranked[:evicted_overflow]:
+            del merged[k]
+
+    return merged, {"evicted_streak": len(evicted_streak), "evicted_overflow": evicted_overflow}
+
+
+def save_pool(pool):
+    """写回池文件 (utf-8, 缩进 1)。CI 里该文件位于 workspace, 由 actions/cache 恢复/保存。"""
+    nodes = sorted(pool.values(), key=lambda v: (-int(v.get("success_count") or 0), v["host"]))
+    out = {"updated_at": _now_ts(), "size": len(nodes), "max_size": POOL_SIZE, "nodes": nodes}
+    with open(POOL_FILE, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=1)
+    log("POOL", f"写回历史池: {len(nodes)} 节点 -> {os.path.basename(POOL_FILE)} (上限 {POOL_SIZE})")
+
+
+# ---------------------------------------------------------------------------
 # 第 3 步: 并发调用 Cloudflare Worker
 # ---------------------------------------------------------------------------
 def classify_network(host, exit_org, is_datacenter=None):
@@ -370,13 +492,14 @@ def check_all(nodes, session):
 # ---------------------------------------------------------------------------
 # 第 4 步: 生成网页数据
 # ---------------------------------------------------------------------------
-def build_outputs(results, raw_count, sstp_count, source):
+def build_outputs(results, raw_count, sstp_count, source, pool_stats=None):
     available = [r for r in results if r.get("success")]
     countries = {}
     for n in available:
         c = n["country"] or "未知"
         countries.setdefault(c, {"code": n["country_code"] or "?", "nodes": []})["nodes"].append(n)
 
+    pool_stats = pool_stats or {}
     stats = {
         "raw_nodes": raw_count,
         "sstp_nodes": sstp_count,
@@ -386,6 +509,11 @@ def build_outputs(results, raw_count, sstp_count, source):
         "countries": len(countries),
         "residential_est": sum(1 for n in available if n["residential"] == "residential"),
         "datacenter_est": sum(1 for n in available if n["residential"] == "datacenter"),
+        # 历史池统计 (本轮从池里救回的节点数 = 池内独有且当轮 success)
+        "pool_size": pool_stats.get("size", 0),
+        "pool_evicted_streak": pool_stats.get("evicted_streak", 0),
+        "pool_evicted_overflow": pool_stats.get("evicted_overflow", 0),
+        "pool_rescued": sum(1 for n in available if n.get("from_pool")),
     }
 
     by_country = {}
@@ -415,11 +543,11 @@ def build_chains_text(data):
     每行 = 「名字 + $sstp://vpn:vpn@host:port」, 名字不变, 指令每 30 分钟自动换。"""
     countries = data["countries"]
     lines = [
+        # 注意: 注释里禁止英文逗号 "," (同 build_hosts_text 的原因)
         "# VPN Gate SSTP 节点 -> edgetunnel 链式代理清单",
+        "# 用法: 在 edgetunnel 节点备注里直接粘贴下面任意一行 (名字与指令连写)",
         f"# 自动更新: {data['generated_at']} (每 30 分钟重新检测)",
         f"# 固定地址: {CHAIN_URL}",
-        "#",
-        "# 用法: 在 edgetunnel 节点备注里直接粘贴下面任意一行 (名字与指令连写)",
         "#   例: 日本-住宅-01$sstp://vpn:vpn@vpnxxx.opengw.net:443",
         "# 名字保持不变, 只有 $sstp:// 后面的地址每 30 分钟自动更换",
         "# 账号密码固定 vpn:vpn ; 端口必须保留",
@@ -452,10 +580,6 @@ def build_chains_text(data):
         for i, n in enumerate(dc_nodes, 1):
             lines.append(f"{zh}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
     return "\n".join(lines) + "\n"
-
-
-# edgetunnel 入口地址池: 客户端直连 Cloudflare 的优选 IP:端口 (循环分配给每个国家节点当入口)
-# 可通过环境变量 EDGE_HOSTS 覆盖 (逗号分隔)
 EDGE_HOSTS = [
     h.strip()
     for h in os.environ.get(
@@ -477,12 +601,16 @@ def build_hosts_text(data):
     _entry = os.environ.get("HOSTS_ENTRY", "").strip()
     edge = [e.strip() for e in _entry.split(",") if e.strip()] or EDGE_HOSTS or [f"{EDT_DOMAIN}:443"]
     lines = [
-        "# edgetunnel「自定义优选IP」清单 (整段复制, 追加到后台现有内容后面)",
+        # 注意: 注释里禁止英文逗号 ","!
+        # edgetunnel 拉取 URL 后按「第一行是否含逗号」判定 CSV, 含逗号会整文件静默丢弃 (无法解析)
+        "# edgetunnel「自定义优选IP」清单",
+        "# 用法一: 整段复制追加到后台「自定义优选IP」框",
+        "# 用法二: 直接把本文件的 URL 填进后台「自定义优选IP」框 (自动更新)",
         f"# 自动更新: {data['generated_at']} (每 30 分钟重新检测)",
         f"# 固定地址: {HOSTS_URL}",
         "# 每行 = 入口地址#名字$sstp://vpn:vpn@节点:端口",
         "# 入口用 7 个实测可用优选域名循环分配",
-        "# 名字 = 国家-住宅/机房-编号, 直接区分住宅与机房",
+        "# 名字 = 国家-住宅/机房-编号、直接区分住宅与机房",
         "# 名字固定; 只有 $sstp:// 后面的节点地址每 30 分钟自动更换",
         "# 账号密码固定 vpn:vpn ; 节点端口必须保留",
         "# ========================================================",
@@ -665,10 +793,14 @@ def main():
     log("VPN GATE", f"SSTP 节点: {sstp_count}")
     log("VPN GATE", f"去重后: {len(uniq)}")
 
+    # 2.5) 历史池合并: 当轮节点 + 池内存活节点 一起检测
+    pool = load_pool()
+    candidates = merge_with_pool(uniq, pool)
+
     # 3) 并发检测
-    log("CLOUDFLARE WORKER", f"提交检测: {len(uniq)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s)")
+    log("CLOUDFLARE WORKER", f"提交检测: {len(candidates)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s)")
     t0 = time.time()
-    results = check_all(uniq, session)
+    results = check_all(candidates, session)
     elapsed = time.time() - t0
 
     success = [r for r in results if r.get("success")]
@@ -680,11 +812,16 @@ def main():
     log("CLOUDFLARE WORKER", f"耗时: {elapsed:.1f}s")
 
     # 硬性失败: Worker 完全不可达 (没有任何一个请求拿到正常响应)
-    if uniq and not success and len(worker_errors) == len(uniq):
+    if candidates and not success and len(worker_errors) == len(candidates):
         die("Worker 全部请求异常, 检测服务不可用 — 本次运行判定失败 (不生成空结果)")
 
+    # 3.5) 更新历史池: success 节点写回, 连续失败淘汰, 上限 POOL_SIZE
+    new_pool, evicted = update_pool(pool, results)
+    save_pool(new_pool)
+    pool_stats = {"size": len(new_pool), **evicted}
+
     # 4) 结果 + 网页
-    data = build_outputs(results, raw_count, sstp_count, source)
+    data = build_outputs(results, raw_count, sstp_count, source, pool_stats)
     log("RESULT", f"可用节点: {len(success)}")
     log("RESULT", f"国家数量: {data['stats']['countries']}")
 

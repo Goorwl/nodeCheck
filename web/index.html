@@ -74,10 +74,11 @@ function renderCards(d) {
   const items = [
     ["最后更新", d.generated_at || "-", "时区 UTC"],
     ["SSTP 节点", s.sstp_nodes, "筛选自 VPN Gate"],
-    ["已检测", s.checked, "提交给 Worker"],
+    ["已检测", s.checked, "当轮 + 历史池"],
     ["可用节点", s.success, "success = true"],
     ["国家数量", s.countries, "按可用节点统计"],
-    ["住宅(估算)", s.residential_est, "数据中心 " + (s.datacenter_est || 0)]
+    ["住宅(估算)", s.residential_est, "数据中心 " + (s.datacenter_est || 0)],
+    ["历史池", s.pool_size || 0, "池内救回 " + (s.pool_rescued || 0)]
   ];
   document.getElementById("cards").innerHTML = items.map(function (x) {
     return '<div class="card"><div class="k">' + x[0] + '</div><div class="v">' + x[1] + '</div><div class="k">' + x[2] + '</div></div>';

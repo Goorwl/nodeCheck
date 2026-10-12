@@ -23,6 +23,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 历史可用节点池: 跨轮持久化 (不进 git, cache 按周滚动 key, 平时命中秒恢复)
+      - name: Restore node pool cache
+        uses: actions/cache@v4
+        with:
+          path: pool.json
+          key: node-pool-${{ github.run_id }}
+          restore-keys: |
+            node-pool-
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
